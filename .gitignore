@@ -1,5 +1,5 @@
 **/*.vscode
 **/*.ipynb
-**/virtual_env
+**/virtenv
 **/__pycache__
 **/*.ipynb_checkpoints
