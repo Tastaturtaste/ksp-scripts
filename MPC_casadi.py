@@ -2,74 +2,106 @@ from casadi import *
 import time
 
 class MPC_Casadi:
-    def __init__(self,spoolup,available_thrust,g,thrust_specific_fuel_consumption):
-        self.opti = Opti()
-        self.opti.solver('ipopt')
-        self.N = 10
-        self.T = 5
-        self.dt = self.T / self.N
-        # Parameters
-        self.spoolup_time = self.opti.parameter()
-        self.available_thrust = self.opti.parameter()
-        self.thrust_specific_fuel_consumption = self.opti.parameter()
-        self.g = self.opti.parameter()
-        self.alt_target = self.opti.parameter()
-        # Variables
-        self.X = self.opti.variable(4,self.N+1) # state trajectory
-        self.pos = self.X[0]
-        self.vel = self.X[1]
-        self.thrust = self.X[2]
-        self.mass = self.X[3]
-        self.U = self.opti.variable(1,self.N)
-        # Set initial guess
-        self.opti.set_initial(self.U,50)
-        # Set Bounds
-        self.opti.subject_to(self.opti.bounded(0,self.U,100))
-        # Costfunction
-        self.opti.minimize( (self.pos-self.alt_target)**2 )
-        # Close Gaps in State
-        for k in range(0,self.N):
-            k1 = self.dynamic(self.X[:,k],self.U[:,k])
-            k2 = self.dynamic(self.X[:,k] + k1 * self.dt/2, self.U[:,k])
-            k3 = self.dynamic(self.X[:,k] + k2 * self.dt/2, self.U[:,k])
-            k4 = self.dynamic(self.X[:,k] + k3 * self.dt, self.U[:,k])
-            X_next = self.X[:,k] + self.dt/6 * (k1 + 2*k2 + 2*k3 + k4)
-            self.opti.subject_to(self.X[:,k+1] == X_next)
-        
+    def __init__(self,T_pred,dt):
+        self.N = int(T_pred / dt)
+        self.ns = 4 # number of states
+        self.nu = 1 # number of inputs
+        self.np = 1 # number of parameters
 
-    def dynamic(self,X,U):
-        dxdt = MX(4,1)
-        dxdt[0] = X[1]
-        dxdt[1] = (X[2] / X[3]) - self.g
-        dxdt[2] = (self.available_thrust * (U[0] / 100) - X[2]) / self.spoolup_time
-        dxdt[3] = -self.thrust_specific_fuel_consumption * X[2]
-        return dxdt
+        h = SX.sym('h')
+        v = SX.sym('v')
+        m = SX.sym('m')
+        thrust = SX.sym('thrust')
+        x = vertcat(h,v,m,thrust)
+        spoolup_time = SX.sym('spoolup_time')
+        max_thrust = SX.sym('max_thrust')
+        mass_loss = SX.sym('mass_loss')
+        grav = SX.sym('grav')
+        p = vertcat(spoolup_time,max_thrust,mass_loss,grav)
+        u = SX.sym('throttle') #between 0 and 100
+        htarget = SX.sym('htarget')
+        vtarget = -2*grav*(h-htarget)
+        j = (v-vtarget)**2
+        #j = (h-htarget)**2
+        hdot = v
+        vdot = (thrust / m) - grav
+        mdot = -thrust*mass_loss
+        thrustdot = (max_thrust * (u/100) - thrust) / spoolup_time
+        xdot = vertcat(hdot,vdot,mdot,thrustdot)
+
+        dae={'x':x,'p':vertcat(htarget,u,p),'ode':xdot,'quad':j}
+
+        X = MX.sym('X',x.sparsity())
+        P = MX.sym('P',p.sparsity())
+        U = MX.sym('U',u.sparsity())
+        TP = MX.sym('TP')
+        intg = integrator('intg','rk',dae,{'number_of_finite_elements':4,'expand':True})
+        F = intg(x0=X,p=vertcat(TP,U,P))
+        xf = F['xf']
+        qf = F['qf']
+        f = Function('f',[X,TP,U,P],[xf,qf],['x0','TP','U','P'],['xf','qf'])
+
+        g = []
+        self.lbg = []
+        self.ubg = []
+        J = 0
+        lbx=[0,-inf,0,0]
+        ubx=[inf,inf,inf,inf]
+        lbu=[0]
+        ubu=[100]
+        X=MX.sym('X',4,self.N+1)
+        U=MX.sym('U',1,self.N)
+        X0=MX.sym('X0',4)
+        P = MX.sym('P',4)
+        TP = MX.sym('TP',self.N)
+        Xk = X[:,0]
+        g+=[Xk - X0]
+        self.lbg += [DM.zeros(Xk.sparsity())]
+        self.ubg += [DM.zeros(Xk.sparsity())]
+        for k in range(self.N):
+            # New NLP variable for the control
+            Uk = U[:,k]
+            #Target Point for this timestep
+            TPk=TP[k]
+            # Integrate till the end of the interval
+            Fk = f(x0=Xk, TP=TPk,U=Uk,P=P)
+            Xk_end = Fk['xf']
+            J=J+Fk['qf']
+            # New NLP variable for state at end of interval
+            Xk = X[:,k+1]
+            # Add equality constraint
+            g   += [Xk_end-Xk]
+            self.lbg += [DM.zeros(Xk.sparsity())]
+            self.ubg += [DM.zeros(Xk.sparsity())]
+        self.lbg = vertcat(*self.lbg)
+        self.ubg = vertcat(*self.ubg)
+        opt_var = vertcat(reshape(X,X.numel(),1),reshape(U,U.numel(),1))
+        prob = {'f': J, 'x': opt_var, 'g': vertcat(*g),'p':vertcat(X0,P,TP)}
+        ipopt_opts = {'ipopt':{'max_iter':30,'warm_start_init_point':'yes','print_level':3}}
+        self.solver = nlpsol('solver', 'ipopt', prob, ipopt_opts)
+        self.lbw = vertcat(repmat(lbx,X.size2(),1),repmat(lbu,U.size2(),1))
+        self.ubw = vertcat(repmat(ubx,X.size2(),1),repmat(ubu,U.size2(),1))
 
     def set_reference(self,alt_target):
-        self.opti.set_value(self.alt_target,alt_target)
+        self.target_alt = DM.ones(self.N,1) * alt_target
 
-    def set_parameters(self,spoolup_time,available_thrust,thrust_specific_fuel_consumption,g):
-        self.opti.set_value(self.spoolup_time,spoolup_time)
-        self.opti.set_value(self.available_thrust,available_thrust)
-        self.opti.set_value(self.thrust_specific_fuel_consumption,thrust_specific_fuel_consumption)
-        self.opti.set_value(self.g,g)
+    def set_parameters(self,spoolup_time,available_thrust,mass_loss,g):
+        self.params = DM([spoolup_time,available_thrust,mass_loss,g])
 
-    def update_state(self,pos,vel,thrust,mass):
-        self.opti.subject_to(self.pos[0]==pos)
-        self.opti.subject_to(self.vel[0]==vel)
-        self.opti.subject_to(self.thrust[0]==thrust)
-        self.opti.subject_to(self.mass[0]==mass)
+    def warmup(self, x0):
+        # x0: h,v,m,thrust
+        self.w0 = vertcat(
+            reshape(DM.ones(self.ns,self.N+1)*x0,self.ns*(self.N+1),1),
+            reshape(DM.ones(self.nu,self.N)*0,self.nu*self.N,1))
+        self.sol = self.solver(x0=self.w0,lbx=self.lbw,ubx=self.ubw,lbg=self.lbg,ubg=self.ubg,p=vertcat(x0,self.params,self.target_alt))
+        return self.sol['x'].full().flatten()[(self.N+1)*self.ns]
 
-    def cycle(self,time_cycle=False):
+    def cycle(self,x0,time_cycle=False):
+        # x0: h,v,m,thrust
         start = time.time()
-        sol = self.opti.solve()
+        self.w0 = vertcat(x0,self.sol['x'][self.ns:])
+        self.sol = self.solver(x0=self.w0,lbx=self.lbw,ubx=self.ubw,lbg=self.lbg,ubg=self.ubg,p=vertcat(x0,self.params,self.target_alt),
+        lam_x0=self.sol['lam_x'],lam_g0=self.sol['lam_g'])
         if time_cycle:
             print('meas_solve_time: ',time.time() - start)
-        return sol.value(self.U)
-
-    def cycle_(self,time_cycle=False):
-        start = time.time()
-        sol = self.opti.solve()
-        if time_cycle:
-            print('meas_solve_time: ',time.time() - start)
-        return sol
+        return self.sol['x'].full().flatten()[(self.N+1)*self.ns]

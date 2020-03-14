@@ -1,7 +1,8 @@
 import krpc
 import time
 import math
-from MPC import MPC_HoverTestVehicle as HTV
+from MPC_casadi import MPC_Casadi as HTV
+#from MPC import MPC_HoverTestVehicle as HTV
 
 conn = krpc.connect(name='connection')
 ves = conn.space_center.active_vessel
@@ -32,42 +33,30 @@ def speed_from_error(error,max_speed,error_at_max_speed):
     else:
         return math.exp(-error*expo) - 1
 
-target_altitude = 500
-ctrl_rate = 4
+Tpred = 5
+intervalsize = 0.2
+
+mass_loss = 5.5*5/70000
+spoolup_time = 0.1
+
+target_altitude = 3000
 ves.control.activate_next_stage()
-mpc = HTV(mass(),0.1, 5.5 * 5 / 70000,g(),altitude(),2,ctrl_rate,8,1)
-mpc.m.options.MEAS_CHK = 1 # set to 0 as soon as bug is fixed
-#mpc.alt.VDVL = 10**5
-#mpc.alt.VLHI = 10**5
-#mpc.alt.VLLO = 10**5
-#mpc.alt.VLACTION = 0
-mpc.update_state(mass(),altitude(),vert_speed())
-mpc.update_parameters(available_thrust(),g())
-mpc.set_reference(500)
-print('solver: ',mpc.m.options.SOLVER)
-#try:
-mpc.m.open_folder()
-ves.control.throttle = mpc.cycle(display=False,GUI=False) * 0.01
+mpc = HTV(Tpred,intervalsize)
+mpc.set_parameters(spoolup_time,available_thrust(),mass_loss,g())
+mpc.set_reference(target_altitude)
+throttle_pct = mpc.warmup([altitude(),vert_speed(),mass(),thrust()]) * 0.01
+ves.control.throttle = throttle_pct * 0.01
 ves.control.activate_next_stage()
-# while altitude() < (target_altitude*0.9):
-#     pass
 while True:
     start = time.time()
     v = vert_speed()
     alt = altitude()
-    mpc.update_state(mass(),altitude(),vert_speed())
-    mpc.update_parameters(available_thrust(),g())
-    throttle_percentage = mpc.cycle(display=False,GUI=False)
-    ves.control.throttle = throttle_percentage / 100
-    #print(throttle_percentage)
-    #print('Objective Function: ', mpc.m.options.OBJFCNVAL)
-    #print('Time to solve: ', mpc.m.options.SOLVETIME)
-    #print('model alt: ', mpc.alt.VALUE)
-    print('model alt bias: ',mpc.alt.BIAS)
-    #print('solver time: ',mpc.m.options.SOLVETIME)
-    #print('measured speed: ',v)
-    #print('measured altitude: ',alt)
-    time.sleep(max(1.0/ctrl_rate - (time.time() - start), 0))
-
-# except:
-#     print('APPINFO: ', mpc.m.options.APPINFO)
+    m = mass()
+    thr = thrust()
+    mpc.set_parameters(0.1,available_thrust(),5.5*5/70000,g())
+    throttle_pct = mpc.cycle([alt,v,mass(),thrust()])
+    ves.control.throttle = throttle_pct / 100
+    spare_time = intervalsize - (time.time() - start)
+    if  spare_time < 0:
+        print('mpc took {} to long!'.format(spare_time))
+    time.sleep(max(spare_time, 0))
