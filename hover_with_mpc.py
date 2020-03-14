@@ -34,6 +34,7 @@ def speed_from_error(error,max_speed,error_at_max_speed):
         return math.exp(-error*expo) - 1
 
 Tpred = 5
+Topt = 2
 intervalsize = 0.2
 
 mass_loss = 5.5*5/70000
@@ -41,7 +42,7 @@ spoolup_time = 0.1
 
 target_altitude = 3000
 ves.control.activate_next_stage()
-mpc = HTV(Tpred,intervalsize)
+mpc = HTV(Tpred,intervalsize,T_opt=Topt)
 mpc.set_parameters(spoolup_time,available_thrust(),mass_loss,g())
 mpc.set_reference(target_altitude)
 throttle_pct = mpc.warmup([altitude(),vert_speed(),mass(),thrust()]) * 0.01

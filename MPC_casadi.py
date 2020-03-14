@@ -2,11 +2,15 @@ from casadi import *
 import time
 
 class MPC_Casadi:
-    def __init__(self,T_pred,dt):
-        self.N = int(T_pred / dt)
+    def __init__(self,T_pred,dt,T_opt=-1):
+        self.N_pred = int(T_pred / dt)
+        if T_opt < 0:
+            self.N_opt = self.N_pred
+        else:
+            self.N_opt = int(T_opt / dt)
         self.ns = 4 # number of states
         self.nu = 1 # number of inputs
-        self.np = 1 # number of parameters
+        self.np = 4 # number of parameters
 
         h = SX.sym('h')
         v = SX.sym('v')
@@ -49,16 +53,24 @@ class MPC_Casadi:
         ubx=[inf,inf,inf,inf]
         lbu=[0]
         ubu=[100]
-        X=MX.sym('X',4,self.N+1)
-        U=MX.sym('U',1,self.N)
-        X0=MX.sym('X0',4)
-        P = MX.sym('P',4)
-        TP = MX.sym('TP',self.N)
+        X=MX.sym('X',self.ns,self.N_pred+1)
+        
+        U_opt=MX.sym('U_opt',self.nu,self.N_opt)
+        U_hold = MX.sym('U_hold',self.nu,self.N_pred-self.N_opt)
+        U = horzcat(U_opt,U_hold)
+
+        X0=MX.sym('X0',self.ns)
+        P = MX.sym('P',self.np)
+        TP = MX.sym('TP',self.N_pred)
         Xk = X[:,0]
         g+=[Xk - X0]
         self.lbg += [DM.zeros(Xk.sparsity())]
         self.ubg += [DM.zeros(Xk.sparsity())]
-        for k in range(self.N):
+        # Setup prediction horizon >= opt horizon
+        g+=[reshape(U_hold,U_hold.numel(),1) - reshape(U_opt[:,-1],self.nu,1)]
+        self.lbg+=[DM.zeros(U_hold.numel())]
+        self.ubg+=[DM.zeros(U_hold.numel())]
+        for k in range(self.N_pred):
             # New NLP variable for the control
             Uk = U[:,k]
             #Target Point for this timestep
@@ -73,17 +85,24 @@ class MPC_Casadi:
             g   += [Xk_end-Xk]
             self.lbg += [DM.zeros(Xk.sparsity())]
             self.ubg += [DM.zeros(Xk.sparsity())]
+        
         self.lbg = vertcat(*self.lbg)
         self.ubg = vertcat(*self.ubg)
-        opt_var = vertcat(reshape(X,X.numel(),1),reshape(U,U.numel(),1))
+        opt_var = vertcat(
+            reshape(X,X.numel(),1),
+            reshape(U,U.numel(),1))
         prob = {'f': J, 'x': opt_var, 'g': vertcat(*g),'p':vertcat(X0,P,TP)}
         ipopt_opts = {'ipopt':{'max_iter':30,'warm_start_init_point':'yes','print_level':3}}
         self.solver = nlpsol('solver', 'ipopt', prob, ipopt_opts)
-        self.lbw = vertcat(repmat(lbx,X.size2(),1),repmat(lbu,U.size2(),1))
-        self.ubw = vertcat(repmat(ubx,X.size2(),1),repmat(ubu,U.size2(),1))
+        self.lbw = vertcat(
+            repmat(lbx,X.size2(),1),
+            repmat(lbu,U.size2(),1))
+        self.ubw = vertcat(
+            repmat(ubx,X.size2(),1),
+            repmat(ubu,U.size2(),1))
 
     def set_reference(self,alt_target):
-        self.target_alt = DM.ones(self.N,1) * alt_target
+        self.target_alt = DM.ones(self.N_pred,1) * alt_target
 
     def set_parameters(self,spoolup_time,available_thrust,mass_loss,g):
         self.params = DM([spoolup_time,available_thrust,mass_loss,g])
@@ -91,10 +110,10 @@ class MPC_Casadi:
     def warmup(self, x0):
         # x0: h,v,m,thrust
         self.w0 = vertcat(
-            reshape(DM.ones(self.ns,self.N+1)*x0,self.ns*(self.N+1),1),
-            reshape(DM.ones(self.nu,self.N)*0,self.nu*self.N,1))
+            reshape(DM.ones(self.ns,self.N_pred+1)*x0,self.ns*(self.N_pred+1),1),
+            reshape(DM.ones(self.nu,self.N_pred)*0,self.nu*self.N_pred,1))
         self.sol = self.solver(x0=self.w0,lbx=self.lbw,ubx=self.ubw,lbg=self.lbg,ubg=self.ubg,p=vertcat(x0,self.params,self.target_alt))
-        return self.sol['x'].full().flatten()[(self.N+1)*self.ns]
+        return self.sol['x'].full().flatten()[(self.N_pred+1)*self.ns]
 
     def cycle(self,x0,time_cycle=False):
         # x0: h,v,m,thrust
@@ -104,4 +123,4 @@ class MPC_Casadi:
         lam_x0=self.sol['lam_x'],lam_g0=self.sol['lam_g'])
         if time_cycle:
             print('meas_solve_time: ',time.time() - start)
-        return self.sol['x'].full().flatten()[(self.N+1)*self.ns]
+        return self.sol['x'].full().flatten()[(self.N_pred+1)*self.ns]
