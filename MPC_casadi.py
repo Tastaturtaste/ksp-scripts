@@ -92,8 +92,12 @@ class MPC_Casadi:
             reshape(X,X.numel(),1),
             reshape(U,U.numel(),1))
         prob = {'f': J, 'x': opt_var, 'g': vertcat(*g),'p':vertcat(X0,P,TP)}
-        ipopt_opts = {'ipopt':{'max_iter':30,'warm_start_init_point':'yes','print_level':3}}
-        self.solver = nlpsol('solver', 'ipopt', prob, ipopt_opts)
+        if True:
+            ipopt_opts = {'ipopt':{'max_iter':30,'warm_start_init_point':'yes','print_level':3}}
+            self.solver = nlpsol('solver', 'ipopt', prob, ipopt_opts)
+        else:
+            qpoases_opts = {'printLevel':'low'}
+            self.solver = qpsol('solver','qpoases',prob,qpoases_opts)
         self.lbw = vertcat(
             repmat(lbx,X.size2(),1),
             repmat(lbu,U.size2(),1))
